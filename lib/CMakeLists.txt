@@ -15,6 +15,9 @@ add_library(dpibypass STATIC
 target_include_directories(dpibypass PUBLIC include)
 target_compile_features(dpibypass PUBLIC cxx_std_17)
 
+# Prevent Windows.h from defining min/max macros
+target_compile_definitions(dpibypass PUBLIC NOMINMAX)
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_sources(dpibypass PRIVATE src/platform/linux.cpp)
     target_compile_definitions(dpibypass PRIVATE DPIBYPASS_LINUX)
@@ -27,4 +30,6 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     target_compile_definitions(dpibypass PRIVATE DPIBYPASS_MACOS)
 endif()
 
-target_link_libraries(dpibypass PRIVATE pthread)
+if(NOT WIN32)
+    target_link_libraries(dpibypass PRIVATE pthread)
+endif()
