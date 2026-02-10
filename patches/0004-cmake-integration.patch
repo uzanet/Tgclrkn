@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tdesktop-dpi-bypass <noreply@example.com>
+Date: Mon, 10 Feb 2026 00:00:00 +0000
+Subject: [PATCH 4/4] CMake: integrate libdpibypass into tdesktop build
+
+---
+
+=== Telegram/CMakeLists.txt ===
+
+Add near the top (after project() declaration):
+
+    # DPI Bypass library
+    option(ENABLE_DPI_BYPASS "Enable DPI bypass functionality" ON)
+    if(ENABLE_DPI_BYPASS)
+        add_subdirectory(lib/dpibypass)
+        add_compile_definitions(DPIBYPASS_ENABLED)
+    endif()
+
+Add to target_link_libraries for the Telegram target:
+
+    if(ENABLE_DPI_BYPASS)
+        target_link_libraries(Telegram PRIVATE dpibypass)
+        target_include_directories(Telegram PRIVATE lib/dpibypass/include)
+    endif()
+
+Add the new source files:
+
+    if(ENABLE_DPI_BYPASS)
+        target_sources(Telegram PRIVATE
+            SourceFiles/mtproto/details/mtproto_dpi_bypass_socket.h
+            SourceFiles/mtproto/details/mtproto_dpi_bypass_socket.cpp
+        )
+    endif()

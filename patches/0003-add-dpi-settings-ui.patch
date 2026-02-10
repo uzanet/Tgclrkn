@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tdesktop-dpi-bypass <noreply@example.com>
+Date: Mon, 10 Feb 2026 00:00:00 +0000
+Subject: [PATCH 3/4] Add DPI bypass settings to UI
+
+Adds DPI bypass configuration to Settings > Advanced > Connection.
+
+---
+
+=== Telegram/SourceFiles/core/core_settings.h ===
+
+Add to the Settings class:
+
+    // DPI Bypass settings
+    bool dpiBypassEnabled() const { return _dpiBypassEnabled; }
+    void setDpiBypassEnabled(bool value) { _dpiBypassEnabled = value; }
+
+    int dpiBypassMode() const { return _dpiBypassMode; }
+    void setDpiBypassMode(int mode) { _dpiBypassMode = mode; }
+    // Mode 0 = Auto, Mode 1 = Manual
+
+    uint32_t dpiBypassTactics() const { return _dpiBypassTactics; }
+    void setDpiBypassTactics(uint32_t tactics) { _dpiBypassTactics = tactics; }
+
+    int dpiBypassSplitPos() const { return _dpiBypassSplitPos; }
+    void setDpiBypassSplitPos(int pos) { _dpiBypassSplitPos = pos; }
+
+Private members:
+
+    bool _dpiBypassEnabled = false;
+    int _dpiBypassMode = 0;  // Auto
+    uint32_t _dpiBypassTactics = 1;  // TcpSplit
+    int _dpiBypassSplitPos = 3;
+
+=== Telegram/SourceFiles/settings/settings_advanced.cpp ===
+
+Add to the Connection section (after proxy settings):
+
+    // DPI Bypass section
+    AddDivider(container);
+    AddSkip(container);
+    AddSubsectionTitle(container, "DPI Bypass");
+
+    const auto dpiToggle = AddButton(
+        container,
+        "Enable DPI bypass",
+        st::settingsButton
+    )->toggleOn(rpl::single(settings.dpiBypassEnabled()));
+
+    dpiToggle->toggledValue() | rpl::start_with_next([=](bool enabled) {
+        Core::App().settings().setDpiBypassEnabled(enabled);
+        Core::App().saveSettingsDelayed();
+    }, container->lifetime());
+
+    const auto modeGroup = std::make_shared<Ui::RadiobuttonGroup>(
+        settings.dpiBypassMode());
+
+    AddButton(container, "Auto-detect tactic", st::settingsButton)
+        ->toggleOn(modeGroup->value() | rpl::map([](int v) { return v == 0; }));
+
+    AddButton(container, "Manual tactic selection", st::settingsButton)
+        ->toggleOn(modeGroup->value() | rpl::map([](int v) { return v == 1; }));
+
+    modeGroup->setChangedCallback([=](int mode) {
+        Core::App().settings().setDpiBypassMode(mode);
+        Core::App().saveSettingsDelayed();
+    });

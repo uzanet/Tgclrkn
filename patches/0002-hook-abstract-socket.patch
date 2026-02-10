@@ -1,0 +1,196 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tdesktop-dpi-bypass <noreply@example.com>
+Date: Mon, 10 Feb 2026 00:00:00 +0000
+Subject: [PATCH 2/4] Hook AbstractSocket with DPI bypass decorator
+
+This patch modifies tdesktop's MTProto socket layer to intercept
+outgoing data through the DPI bypass library.
+
+Key changes:
+- Add nativeDescriptor() virtual method to AbstractSocket
+- Implement nativeDescriptor() in TcpSocket via QAbstractSocket::socketDescriptor()
+- Create DpiBypassSocket decorator class
+- Modify AbstractSocket::Create() to wrap sockets when DPI bypass is enabled
+
+---
+
+The following files need to be modified in tdesktop:
+
+=== Telegram/SourceFiles/mtproto/details/mtproto_abstract_socket.h ===
+
+Add after the existing virtual methods:
+
+    // DPI bypass: access to native socket descriptor
+    virtual qintptr nativeDescriptor() const { return -1; }
+
+=== Telegram/SourceFiles/mtproto/details/mtproto_tcp_socket.h ===
+
+Add override:
+
+    qintptr nativeDescriptor() const override;
+
+=== Telegram/SourceFiles/mtproto/details/mtproto_tcp_socket.cpp ===
+
+Add implementation:
+
+    qintptr TcpSocket::nativeDescriptor() const {
+        return _socket.socketDescriptor();
+    }
+
+=== NEW FILE: Telegram/SourceFiles/mtproto/details/mtproto_dpi_bypass_socket.h ===
+
+```cpp
+#pragma once
+
+#include "mtproto/details/mtproto_abstract_socket.h"
+#include "dpibypass/dpibypass.h"
+
+#include <memory>
+
+namespace MTP::details {
+
+class DpiBypassSocket final : public AbstractSocket {
+public:
+    DpiBypassSocket(
+        not_null<QThread*> thread,
+        std::unique_ptr<AbstractSocket> inner);
+
+    void connectToHost(const QString &address, int port) override;
+    bool isConnected() override;
+    bool hasBytesAvailable() override;
+    int64 read(bytes::span buffer) override;
+    void write(bytes::const_span prefix, bytes::const_span buffer) override;
+
+    int32 debugState() override;
+
+    qintptr nativeDescriptor() const override {
+        return inner_->nativeDescriptor();
+    }
+
+private:
+    void onConnected();
+    void onDisconnected();
+    void onReadyRead();
+    void onError(int errorCode);
+
+    std::unique_ptr<AbstractSocket> inner_;
+    std::unique_ptr<dpibypass::BypassSocket> bypass_;
+    bool first_write_ = true;
+};
+
+} // namespace MTP::details
+```
+
+=== NEW FILE: Telegram/SourceFiles/mtproto/details/mtproto_dpi_bypass_socket.cpp ===
+
+```cpp
+#include "mtproto/details/mtproto_dpi_bypass_socket.h"
+#include "dpibypass/auto_selector.h"
+
+namespace MTP::details {
+
+DpiBypassSocket::DpiBypassSocket(
+    not_null<QThread*> thread,
+    std::unique_ptr<AbstractSocket> inner)
+: AbstractSocket(thread)
+, inner_(std::move(inner)) {
+    connect(inner_.get(), &AbstractSocket::connected,
+            this, &DpiBypassSocket::onConnected);
+    connect(inner_.get(), &AbstractSocket::disconnected,
+            this, &DpiBypassSocket::onDisconnected);
+    connect(inner_.get(), &AbstractSocket::readyRead,
+            this, &DpiBypassSocket::onReadyRead);
+    connect(inner_.get(), &AbstractSocket::error,
+            this, &DpiBypassSocket::onError);
+}
+
+void DpiBypassSocket::connectToHost(const QString &address, int port) {
+    first_write_ = true;
+    bypass_.reset();
+    inner_->connectToHost(address, port);
+}
+
+void DpiBypassSocket::onConnected() {
+    auto fd = inner_->nativeDescriptor();
+    if (fd >= 0) {
+        bypass_ = std::make_unique<dpibypass::BypassSocket>(
+            static_cast<dpibypass::socket_t>(fd));
+
+        // Try to get cached tactic, or use default TCP split
+        static dpibypass::AutoSelector selector;
+        // TODO: Get host from connection info for cache lookup
+        auto config = dpibypass::TacticConfig::tcp_split_only(3);
+        bypass_->setConfig(config);
+        bypass_->onConnected();
+    }
+    emit connected();
+}
+
+void DpiBypassSocket::onDisconnected() {
+    bypass_.reset();
+    emit disconnected();
+}
+
+void DpiBypassSocket::onReadyRead() {
+    emit readyRead();
+}
+
+void DpiBypassSocket::onError(int errorCode) {
+    emit error(errorCode);
+}
+
+bool DpiBypassSocket::isConnected() {
+    return inner_->isConnected();
+}
+
+bool DpiBypassSocket::hasBytesAvailable() {
+    return inner_->hasBytesAvailable();
+}
+
+int64 DpiBypassSocket::read(bytes::span buffer) {
+    return inner_->read(buffer);
+}
+
+void DpiBypassSocket::write(bytes::const_span prefix, bytes::const_span buffer) {
+    if (bypass_ && first_write_) {
+        // Combine prefix + buffer for DPI bypass processing
+        std::vector<uint8_t> combined;
+        combined.reserve(prefix.size() + buffer.size());
+        combined.insert(combined.end(),
+            reinterpret_cast<const uint8_t*>(prefix.data()),
+            reinterpret_cast<const uint8_t*>(prefix.data()) + prefix.size());
+        combined.insert(combined.end(),
+            reinterpret_cast<const uint8_t*>(buffer.data()),
+            reinterpret_cast<const uint8_t*>(buffer.data()) + buffer.size());
+
+        auto result = bypass_->writeWithBypass(combined.data(), combined.size());
+        first_write_ = false;
+
+        if (result.success) {
+            return;  // Data sent directly through bypass socket
+        }
+        // Fallback to normal write if bypass fails
+    }
+
+    inner_->write(prefix, buffer);
+}
+
+int32 DpiBypassSocket::debugState() {
+    return inner_->debugState();
+}
+
+} // namespace MTP::details
+```
+
+=== Telegram/SourceFiles/mtproto/details/mtproto_abstract_socket.cpp ===
+
+Modify AbstractSocket::Create() factory:
+
+Add at the end, before returning:
+
+    // Wrap with DPI bypass if enabled
+    // TODO: Check DpiBypassSettings::enabled()
+    #ifdef DPIBYPASS_ENABLED
+    auto result = /* existing socket creation */;
+    return std::make_unique<DpiBypassSocket>(thread, std::move(result));
+    #endif

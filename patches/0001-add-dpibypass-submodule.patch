@@ -1,0 +1,17 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tdesktop-dpi-bypass <noreply@example.com>
+Date: Mon, 10 Feb 2026 00:00:00 +0000
+Subject: [PATCH 1/4] Add libdpibypass as a subdirectory
+
+Adds the DPI bypass library to the tdesktop build tree.
+The library source should be symlinked or copied to Telegram/lib/dpibypass/.
+
+---
+ Telegram/lib/dpibypass | 1 +
+ 1 file changed, 1 insertion(+)
+
+NOTE: This patch expects that apply_patches.sh has already
+created a symlink from Telegram/lib/dpibypass -> <project>/lib/
+
+No actual git diff needed — the symlink is created by the script.
+This patch file serves as documentation of the dependency.
