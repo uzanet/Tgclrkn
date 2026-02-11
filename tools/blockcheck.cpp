@@ -7,6 +7,17 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#pragma comment(lib, "ws2_32.lib")
+
+struct WinsockInit {
+    WinsockInit() { WSADATA w; WSAStartup(MAKEWORD(2, 2), &w); }
+    ~WinsockInit() { WSACleanup(); }
+};
+static WinsockInit _wsa;
+#endif
+
 using namespace dpibypass;
 
 namespace {
@@ -24,31 +35,30 @@ const char* tactic_name(Tactic t) {
     }
 }
 
-void print_config(const TacticConfig& config) {
-    uint32_t val = static_cast<uint32_t>(config.tactics);
-    printf("  Tactics bitmask: 0x%02X\n", val);
-    printf("  Active tactics:");
-
-    const Tactic all_tactics[] = {
+std::string tactics_str(const TacticConfig& config) {
+    const Tactic all[] = {
         Tactic::TcpSplit, Tactic::FakeRst, Tactic::FakeData,
         Tactic::Disorder, Tactic::OOB, Tactic::TlsRecordSplit,
     };
-
-    bool any = false;
-    for (auto t : all_tactics) {
+    std::string result;
+    for (auto t : all) {
         if (has_tactic(config.tactics, t)) {
-            printf(" %s", tactic_name(t));
-            any = true;
+            if (!result.empty()) result += "+";
+            result += tactic_name(t);
         }
     }
-    if (!any) printf(" None");
-    printf("\n");
-
-    printf("  Split position: %d\n", config.split_position);
-    printf("  Fake TTL: %d\n", config.fake_ttl);
+    if (result.empty()) result = "None";
+    return result;
 }
 
-// Known Telegram DC IPs (IPv4)
+void print_config(const TacticConfig& config) {
+    printf("  Tactics: %s\n", tactics_str(config).c_str());
+    printf("  Split position: %d\n", config.split_position);
+    if (has_tactic(config.tactics, Tactic::FakeRst) || has_tactic(config.tactics, Tactic::FakeData)) {
+        printf("  Fake TTL: %d\n", config.fake_ttl);
+    }
+}
+
 struct DCInfo {
     const char* name;
     const char* ip;
@@ -68,19 +78,24 @@ const DCInfo telegram_dcs[] = {
 
 void print_usage(const char* prog) {
     printf("Usage: %s [options]\n\n", prog);
-    printf("DPI bypass tactic checker for Telegram connections.\n\n");
+    printf("DPI bypass tactic checker for Telegram connections.\n");
+    printf("Tests each DPI bypass tactic and shows detailed diagnostics.\n\n");
     printf("Options:\n");
     printf("  -h, --help       Show this help\n");
     printf("  -t, --timeout N  Probe timeout in ms (default: 5000)\n");
     printf("  -a, --all        Test all DCs (default: DC2 only)\n");
+    printf("  -v, --verbose    Show details for each tactic probe\n");
     printf("  -H, --host HOST  Test specific host\n");
     printf("  -p, --port PORT  Test specific port (default: 443)\n");
+    printf("  -d, --direct     Also test direct connection (no DPI bypass)\n");
     printf("\n");
 }
 
 int main(int argc, char* argv[]) {
     int timeout = 5000;
     bool test_all = false;
+    bool verbose = false;
+    bool test_direct = false;
     std::string custom_host;
     int custom_port = 443;
 
@@ -95,6 +110,12 @@ int main(int argc, char* argv[]) {
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--all") == 0) {
             test_all = true;
         }
+        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
+            verbose = true;
+        }
+        if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--direct") == 0) {
+            test_direct = true;
+        }
         if ((strcmp(argv[i], "-H") == 0 || strcmp(argv[i], "--host") == 0) && i + 1 < argc) {
             custom_host = argv[++i];
         }
@@ -106,32 +127,26 @@ int main(int argc, char* argv[]) {
     printf("=== DPI Bypass Tactic Checker (blockcheck) ===\n\n");
     printf("Probe timeout: %d ms\n\n", timeout);
 
-    auto candidates = AutoSelector::defaultCandidates();
-    printf("Testing %zu tactic combinations:\n", candidates.size());
+    // Build candidate list
+    std::vector<TacticConfig> candidates;
+    if (test_direct) {
+        TacticConfig direct;
+        direct.tactics = Tactic::None;
+        candidates.push_back(direct);
+    }
+    auto defaults = AutoSelector::defaultCandidates();
+    candidates.insert(candidates.end(), defaults.begin(), defaults.end());
+
+    printf("Probing %zu tactic combinations:\n", candidates.size());
     for (size_t i = 0; i < candidates.size(); ++i) {
-        printf("  [%zu] ", i + 1);
-        uint32_t val = static_cast<uint32_t>(candidates[i].tactics);
-        const Tactic all_tactics[] = {
-            Tactic::TcpSplit, Tactic::FakeRst, Tactic::FakeData,
-            Tactic::Disorder, Tactic::OOB, Tactic::TlsRecordSplit,
-        };
-        for (auto t : all_tactics) {
-            if (has_tactic(candidates[i].tactics, t)) {
-                printf("%s ", tactic_name(t));
-            }
-        }
-        if (val == 0) printf("None");
-        printf("\n");
+        printf("  [%zu] %s (split=%d)\n", i + 1,
+               tactics_str(candidates[i]).c_str(),
+               candidates[i].split_position);
     }
     printf("\n");
 
-    // Build list of endpoints to test
-    struct Endpoint {
-        std::string name;
-        std::string host;
-        int port;
-    };
-
+    // Build endpoints
+    struct Endpoint { std::string name; std::string host; int port; };
     std::vector<Endpoint> endpoints;
     if (!custom_host.empty()) {
         endpoints.push_back({custom_host, custom_host, custom_port});
@@ -147,24 +162,67 @@ int main(int argc, char* argv[]) {
     selector.setProbeTimeout(timeout);
 
     for (const auto& ep : endpoints) {
-        printf("--- Testing %s (%s:%d) ---\n", ep.name.c_str(), ep.host.c_str(), ep.port);
+        printf("--- %s (%s:%d) ---\n", ep.name.c_str(), ep.host.c_str(), ep.port);
 
-        bool found = false;
-        selector.probe(ep.host, ep.port, candidates,
-                       [&](TacticConfig best) {
-            if (best.tactics != Tactic::None) {
-                printf("  SUCCESS! Working tactic found:\n");
-                print_config(best);
-                found = true;
+        bool any_success = false;
+
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            const auto& config = candidates[i];
+            std::string name = tactics_str(config);
+
+            if (verbose) {
+                printf("  [%zu] Testing %s... ", i + 1, name.c_str());
+                fflush(stdout);
             }
-        });
 
-        if (!found) {
-            printf("  FAILED: No working tactic found.\n");
-            printf("  Possible reasons:\n");
-            printf("    - Host unreachable (check network)\n");
-            printf("    - DPI not blocking this endpoint\n");
-            printf("    - All tactics exhausted, need new approaches\n");
+            ProbeResult result = selector.probeSingle(ep.host, ep.port, config);
+
+            if (result.success) {
+                if (verbose) {
+                    printf("OK (%dms)", result.latency_ms);
+                    if (!result.error.empty()) printf(" [%s]", result.error.c_str());
+                    printf("\n");
+                } else {
+                    printf("  [OK] %s (%dms)\n", name.c_str(), result.latency_ms);
+                }
+                if (!any_success) {
+                    printf("\n  >>> Best working tactic: %s <<<\n", name.c_str());
+                    print_config(config);
+                    any_success = true;
+                }
+                if (!verbose) break;  // In non-verbose mode, stop at first success
+            } else {
+                if (verbose) {
+                    printf("FAIL - %s\n", result.error.c_str());
+                } else {
+                    printf("  [--] %s: %s\n", name.c_str(), result.error.c_str());
+                }
+            }
+        }
+
+        if (!any_success) {
+            printf("\n  >>> No working tactic found <<<\n");
+            printf("  Diagnostics:\n");
+            // Run one more probe with None to check basic connectivity
+            TacticConfig none;
+            none.tactics = Tactic::None;
+            ProbeResult direct = selector.probeSingle(ep.host, ep.port, none);
+            if (direct.success) {
+                printf("    - Direct connection works! DPI is NOT blocking this endpoint.\n");
+                printf("    - No DPI bypass needed for %s\n", ep.host.c_str());
+            } else if (direct.error.find("TCP connect") != std::string::npos) {
+                printf("    - TCP connection failed: %s\n", direct.error.c_str());
+                printf("    - The host may be IP-blocked (not just DPI).\n");
+                printf("    - DPI bypass cannot help with IP-level blocks.\n");
+                printf("    - You may need a proxy/VPN instead.\n");
+            } else if (direct.error.find("reset") != std::string::npos) {
+                printf("    - Connection was reset (RST). This looks like DPI blocking.\n");
+                printf("    - But none of our tactics worked. Try:\n");
+                printf("      * Increasing timeout: blockcheck -t 10000\n");
+                printf("      * Different split positions may be needed\n");
+            } else {
+                printf("    - Direct probe result: %s\n", direct.error.c_str());
+            }
         }
         printf("\n");
     }
